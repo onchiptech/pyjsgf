@@ -2,18 +2,14 @@
 This module contains classes for compiling and matching JSpeech Grammar Format rule
 expansions.
 """
-
-import functools
-import math
-import random
 import re
 from copy import deepcopy
 
 import pyparsing
-from six import string_types, integer_types
+from six import string_types, PY2, integer_types
 
 from .errors import CompilationError, GrammarError
-from . import references
+from .references import BaseRef, optionally_qualified_name
 
 
 class TraversalOrder(object):
@@ -241,10 +237,9 @@ class JointTreeContext(object):
         map_expansion(self._root, self.detach_tree, TraversalOrder.PostOrder)
 
 
-@functools.total_ordering
-class ChildList(object):
+class ChildList(list):
     """
-    List wrapper class for expansion child lists.
+    List subclass for expansion child lists.
 
     The ``parent`` attribute of each child will be set appropriately when they
     added or removed from lists.
@@ -263,45 +258,19 @@ class ChildList(object):
                 return x
 
             seq = map(f, seq)
-
-        # Use an internal list rather than sub-classing to avoid pickling issues.
-        self._list = list(seq)
-
-    def __repr__(self):
-        return repr(self._list)
-
-    def __lt__(self, other):
-        return self._list < other
-
-    def __eq__(self, other):
-        return self._list == other
-
-    def __len__(self):
-        return len(self._list)
-
-    def __not__(self):
-        return not(self._list)
-
-    def __add__(self, other):
-        return self._list + other
-
-    def __iadd__(self, other):
-        self._list += other
+        super(ChildList, self).__init__(seq)
 
     def append(self, e):
         e = Expansion.make_expansion(e)
-        self._list.append(e)
+        super(ChildList, self).append(e)
         e.parent = self._expansion
-
-    def __iter__(self):
-        return iter(self._list)
 
     def clear(self):
         """
         Remove all expansions from this list and unset their parent attributes.
         """
         # Clear the list using remove().
-        for c in tuple(self._list):
+        for c in tuple(self):
             self.remove(c)
 
     def orphan_children(self):
@@ -320,31 +289,26 @@ class ChildList(object):
             e.parent = self._expansion
 
         # Call the super method to extend the list.
-        self._list.extend(iterable)
-
-    def index(self, value, start=0, end=None):
-        if end is None:
-            end = len(self._list)
-        return self._list.index(value, start, end)
+        super(ChildList, self).extend(iterable)
 
     def insert(self, index, e):
         # Make e an Expansion, call the super method and set e's parent.
         e = Expansion.make_expansion(e)
-        self._list.insert(index, e)
+        super(ChildList, self).insert(index, e)
         e.parent = self._expansion
 
     def pop(self, index=-1):
         # Pop item at the specified index (default -1), set its parent to None
         # and return it.
-        e = self._list.pop(index)
+        e = super(ChildList, self).pop(index)
         e.parent = None
         return e
 
     def remove(self, value):
         # Set the parent before removing the expansion.
         # 'value' is not necessarily in the list, so we can't use that.
-        self._list[self._list.index(value)].parent = None
-        self._list.remove(value)
+        self[self.index(value)].parent = None
+        super(ChildList, self).remove(value)
 
     def __setslice__(self, i, j, sequence):
         """
@@ -361,19 +325,19 @@ class ChildList(object):
         def orphan(x):
             x.parent = None
 
-        [orphan(c) for c in self._list[i:j]]
+        [orphan(c) for c in self[i:j]]
 
-        # Set the slice.
-        self._list[slice(i, j)] = sequence
+        # Call the appropriate super method for the Python version.
+        if PY2:
+            super(ChildList, self).__setslice__(i, j, sequence)
+        else:
+            super(ChildList, self).__setitem__(slice(i, j), sequence)
 
         # Adopt the new children :-)
         def adopt(x):
             x.parent = self._expansion
 
         [adopt(c) for c in sequence]
-
-    def __getitem__(self, key):
-        return self._list[key]
 
     def __setitem__(self, i, value):
         # Handle setting slices separately for my sanity.
@@ -385,13 +349,13 @@ class ChildList(object):
         value = Expansion.make_expansion(value)
 
         # Orphan the old child :-(
-        self._list[i].parent = None
+        self[i].parent = None
 
-        # Set the Expansion in the internal list.
-        self._list[i] = value
+        # Call the super method to set the Expansion.
+        super(ChildList, self).__setitem__(i, value)
 
         # Adopt the new child :-)
-        self._list[i].parent = self._expansion
+        self[i].parent = self._expansion
 
 
 class Expansion(object):
@@ -473,7 +437,7 @@ class Expansion(object):
 
     @children.setter
     def children(self, value):
-        if not isinstance(value, (tuple, list, ChildList)):
+        if not isinstance(value, (tuple, list)):
             raise TypeError("'children' must be a list or tuple")
 
         # Orphan current children if applicable.
@@ -489,10 +453,6 @@ class Expansion(object):
             return self.compiled_tag
         else:
             return ""
-        
-    def generate(self):
-        """Generate a string matching this expansion."""
-        return ""
 
     @property
     def parent(self):
@@ -912,11 +872,6 @@ class Expansion(object):
     def __contains__(self, item):
         return item in flat_map_expansion(self)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['_matcher_element'] = None
-        return state
-
     @property
     def is_optional(self):
         """
@@ -950,12 +905,14 @@ class Expansion(object):
         :returns: Expansion
         """
         parent = self.parent
-        if parent and hasattr(parent, "repetitions_matched"):
-            return parent
-        elif parent:
-            return self.parent.repetition_ancestor
-        else:
-            return None
+        result = None
+        while parent:
+            if isinstance(parent, Repeat):
+                result = parent
+                break
+            parent = parent.parent
+
+        return result
 
     def collect_leaves(self, order=TraversalOrder.PreOrder, shallow=False):
         """
@@ -1097,18 +1054,18 @@ class Expansion(object):
         return result
 
 
-class BaseExpansionRef(references.BaseRef, Expansion):
+class BaseExpansionRef(BaseRef, Expansion):
     """
     Base class which RuleRef, NamedRuleRef, NullRef and VoidRef inherit from.
     """
     def __init__(self, name):
         # Call both super constructors
-        references.BaseRef.__init__(self, name)
+        BaseRef.__init__(self, name)
         Expansion.__init__(self, [])
 
     @staticmethod
     def valid(name):
-        return references.optionally_qualified_name.matches(name)
+        return optionally_qualified_name.matches(name)
 
     def compile(self, ignore_tags=False):
         self.validate_compilable()
@@ -1124,8 +1081,7 @@ class BaseExpansionRef(references.BaseRef, Expansion):
         return hash("%s" % self)
 
     def __eq__(self, other):
-        return (Expansion.__eq__(self, other) and
-                references.BaseRef.__eq__(self, other))
+        return Expansion.__eq__(self, other) and BaseRef.__eq__(self, other)
 
     def __copy__(self):
         e = type(self)(self.name)
@@ -1155,14 +1111,6 @@ class NamedRuleRef(BaseExpansionRef):
             return self.rule.grammar.get_rule_from_name(self.name)
         else:
             raise GrammarError("cannot get referenced Rule object from Grammar")
-    
-    def generate(self):
-        """
-        Generate a string matching the referenced rule's expansion.
-
-        :rtype: str
-        """
-        return self.referenced_rule.generate()
 
     def _make_matcher_element(self):
         # Wrap the parser element for the referenced rule's root expansion so that
@@ -1251,9 +1199,6 @@ class SingleChildExpansion(ExpansionWithChildren):
             return None  # the child has been removed
         else:
             return self.children[0]
-        
-    def generate(self):
-        return self.child.generate()
 
     def __hash__(self):
         return super(SingleChildExpansion, self).__hash__()
@@ -1273,9 +1218,6 @@ class SingleChildExpansion(ExpansionWithChildren):
 class VariableChildExpansion(ExpansionWithChildren):
     def __init__(self, *expansions):
         super(VariableChildExpansion, self).__init__(expansions)
-        
-    def generate(self):
-        return " ".join([c for c in [e.generate() for e in self.children] if c])
 
     def __hash__(self):
         return super(VariableChildExpansion, self).__hash__()
@@ -1328,11 +1270,10 @@ class Literal(Expansion):
     """
     Expansion class for literals.
     """
-    def __init__(self, text, case_sensitive=False):
+    def __init__(self, text):
         # Set _text and use the text setter to validate the input.
         self._text = ""
         self.text = text
-        self._case_sensitive = bool(case_sensitive)
         super(Literal, self).__init__([])
 
     def __str__(self):
@@ -1342,57 +1283,22 @@ class Literal(Expansion):
         return hash("%s" % self)
 
     @property
-    def case_sensitive(self):
-        """
-        Case sensitivity used when matching and compiling :class:`Literal` rule
-        expansions.
-
-        This property can be ``True`` or ``False``. Matching and compilation will
-        be *case-sensitive* if ``True`` and *case-insensitive* if ``False``. The
-        default value is ``False``.
-
-        :rtype: bool
-        :returns: literal case sensitivity
-        """
-        return self._case_sensitive
-
-    @case_sensitive.setter
-    def case_sensitive(self, value):
-        self._case_sensitive = bool(value)
-        self.invalidate_matcher()
-
-    @property
     def text(self):
         """
         Text to match/compile.
 
-        This will return lowercase text if :py:attr:`~case_sensitive` is not
-        ``True``.
-
-        :rtype: str
-        :returns: text
+        Text will be put in lowercase. Override ``text``'s setter to
+        change that behaviour.
         """
-        text = self._text
-        if not self.case_sensitive:
-            text = text.lower()
-        return text
+        return self._text
 
     @text.setter
     def text(self, value):
         if not isinstance(value, string_types):
             raise TypeError("expected string, got %s instead" % value)
 
-        self._text = value
-
-    def generate(self):
-        """
-        Generate a string matching this expansion's text.
-
-        This will just return the value of ``text``.
-
-        :rtype: str
-        """
-        return self.text
+        # Use lowercase text by convention.
+        self._text = value.lower()
 
     def __copy__(self):
         e = type(self)(self.text)
@@ -1410,8 +1316,9 @@ class Literal(Expansion):
 
     def compile(self, ignore_tags=False):
         super(Literal, self).compile()
-        if self.tag and not ignore_tags:
-            return "%s%s" % (self.text, self.compiled_tag)
+        if self.tag and not ignore_tags:            
+            #return "%s%s" % (self.text, self.compiled_tag)
+            return "__begin__%s %s __end__%s" % (self.tag, self.text, self.tag)
         else:
             return self.text
 
@@ -1437,17 +1344,10 @@ class Literal(Expansion):
         return re.compile(r"\s+".join(words))
 
     def _make_matcher_element(self):
-        # Return a case-sensitive or case-insensitive pyparsing Literal element.
-        text = self._text
-        if self.case_sensitive:
-            matcher_cls = pyparsing.Literal
-        else:
-            matcher_cls = pyparsing.CaselessLiteral
-        return self._set_matcher_element_attributes(matcher_cls(text))
+        return self._set_matcher_element_attributes(pyparsing.Literal(self.text))
 
     def __eq__(self, other):
-        return (super(Literal, self).__eq__(other) and self.text == other.text and
-                self.case_sensitive == other.case_sensitive)
+        return super(Literal, self).__eq__(other) and self.text == other.text
 
 
 class RuleRef(NamedRuleRef):
@@ -1501,17 +1401,6 @@ class Repeat(SingleChildExpansion):
             return "(%s)+%s" % (compiled, self.compiled_tag)
         else:
             return "(%s)+" % compiled
-        
-    def generate(self):
-        """
-        Generate a string matching this expansion.
-
-        This method can generate one or more repetitions of the child expansion.
-
-        :rtype: str
-        """
-        c = int(math.log(random.random() / 2, 0.5))
-        return " ".join([self.child.generate() for _ in range(c)])
 
     def __hash__(self):
         return super(Repeat, self).__hash__()
@@ -1571,11 +1460,11 @@ class Repeat(SingleChildExpansion):
                 self.child.reset_for_new_match()
             return tokens
 
-        # Get the child's matcher element and add the extra parse action.
-        child_element = self.child.matcher_element.addParseAction(f)
+        # Add the extra parse action.
+        e = self.child.matcher_element.addParseAction(f)
 
         # Determine the parser element type to use.
-        type_ = pyparsing.ZeroOrMore if self.is_optional else pyparsing.OneOrMore
+        t = pyparsing.ZeroOrMore if self.is_optional else pyparsing.OneOrMore
 
         # Handle the special case of a repetition ancestor, e.g. ((a b)+)+
         rep = self.repetition_ancestor
@@ -1593,10 +1482,9 @@ class Repeat(SingleChildExpansion):
             # Use an And element instead if self is the only branch because
             # it makes no sense to repeat a repeat like this!
             if only_branch:
-                type_ = pyparsing.And
-                child_element = [child_element]
+                t = pyparsing.And
 
-        return self._set_matcher_element_attributes(type_(child_element))
+        return self._set_matcher_element_attributes(t(e))
 
     def reset_match_data(self):
         super(Repeat, self).reset_match_data()
@@ -1618,18 +1506,6 @@ class KleeneStar(Repeat):
             return "(%s)*%s" % (compiled, self.compiled_tag)
         else:
             return "(%s)*" % compiled
-        
-    def generate(self):
-        """
-        Generate a string matching this expansion.
-
-        This method can generate zero or more repetitions of the child expansion,
-        zero repetitions meaning the empty string (`""`) will be returned.
-
-        :rtype: str
-        """
-        c = int(math.log(random.random() / 2, 0.5)) - 1
-        return " ".join([self.child.generate() for _ in range(c)])
 
     @property
     def is_optional(self):
@@ -1650,9 +1526,6 @@ class OptionalGrouping(SingleChildExpansion):
             return "[%s]%s" % (compiled, self.compiled_tag)
         else:
             return "[%s]" % compiled
-        
-    def generate(self):
-        return random.choice([self.child.generate(), ""])
 
     def _make_matcher_element(self):
         return self._set_matcher_element_attributes(
@@ -1672,15 +1545,18 @@ class RequiredGrouping(Sequence):
     Subclass of ``Sequence`` for wrapping multiple expansions in parenthesises.
     """
     def compile(self, ignore_tags=False):
-        super(RequiredGrouping, self).compile()
+        super(RequiredGrouping, self).compile()        
+
         grouping = " ".join([
             e.compile(ignore_tags) for e in self.children
         ])
 
         if self.tag and not ignore_tags:
-            return "(%s)%s" % (grouping, self.compiled_tag)
+            #return "(%s)%s" % (grouping, self.compiled_tag)
+            return "__begin__%s (%s) __end__%s" % (self.tag, grouping, self.tag)
         else:
-            return "(%s)" % grouping
+            return "(%s)" % grouping            
+
 
     def __hash__(self):
         return super(RequiredGrouping, self).__hash__()
@@ -1782,6 +1658,7 @@ class AlternativeSet(VariableChildExpansion):
 
     def compile(self, ignore_tags=False):
         super(AlternativeSet, self).compile()
+        
         if self._weights:
             self._validate_weights()
 
@@ -1798,37 +1675,11 @@ class AlternativeSet(VariableChildExpansion):
                 e.compile(ignore_tags) for e in self.children
             ])
 
-        if self.tag and not ignore_tags:
-            return "(%s)%s" % (alt_set, self.compiled_tag)
+        if self.tag and not ignore_tags:            
+            #return "(%s)%s" % (alt_set, self.compiled_tag)
+            return "__begin__%s (%s) __end__%s" % (self.tag, alt_set, self.tag)
         else:
             return "(%s)" % alt_set
-        
-    def generate(self):
-        """
-        Generate a matching string for this alternative set.
-
-        Each alternative has an equal chance of being chosen for string generation.
-
-        If weights are set, then the probability of an alternative is its weight over
-        the sum of all weights::
-
-            p = w / sum(weights)
-
-        """
-        if self._weights:
-            self._validate_weights()
-            # use weights if they are set
-            # each alternative gets the probability weight / sum_of_all_weights
-            w_sum = sum(self._weights.values())
-            rand = random.random()
-            # print("rand = %s" % rand)
-            help_sum = 0
-            for child, weight in self._weights.items():
-                help_sum += (weight / w_sum)
-                # print(help_sum)
-                if rand < help_sum:
-                    return child.generate()
-        return random.choice(self.children).generate()
 
     def _make_matcher_element(self):
         # Return an element that can match the alternatives.
